@@ -1571,21 +1571,34 @@ class MemoryLLM(LlamaForCausalLM):
 
 
     def drop_memory(self, current_memory, drop_length=None, unsequeezed=True):
+        """
+        1. 内存管理: 防止记忆无限增长，保持固定的记忆容量
+        2. 随机遗忘: 通过随机丢弃模拟人类记忆的遗忘机制
+        3. 比例控制: 通过 self.num_blocks 参数控制记忆保留比例
+        """
 
+        # [layer_num, memory_length, hidden_dim]
         if unsequeezed:
 
+            # 如果没有指定 drop_length，则丢弃 1 - (1 / self.num_blocks) 比例的记忆，默认操作
+            # 默认
             if drop_length is None:
+                # torch.randperm(n): 生成 0 到 n-1 的随机排列
+                # [:end]: 取前 end 个索引，保留这部分记忆
+                # current_memory.shape[1] - int(current_memory.shape[1] * (1 / self.num_blocks)): 计算要保留的记忆数量
                 left_indices = torch.randperm(current_memory.shape[1])[:current_memory.shape[1] - int(current_memory.shape[1] * (1 / self.num_blocks))]
             else:
                 left_indices = torch.randperm(current_memory.shape[1])[:current_memory.shape[1] - drop_length]
             
             # sort left_indices to make sure it is in ascending order
+            # 确保保留的记忆索引是按升序排列的，这对于维持记忆的时间顺序和一致性很重要
             left_indices = left_indices.sort()[0]
 
             current_memory = current_memory[:, left_indices, :]
             
             return current_memory
 
+        # [memory_length, hidden_dim]
         else:
 
             if drop_length is None:
@@ -1601,48 +1614,74 @@ class MemoryLLM(LlamaForCausalLM):
             return current_memory
 
     def update_memory_with_delta_memory(self, delta_memory):
-        
+        """
+        通过动态记忆管理，实现模型的持续学习和知识更新能力
+        1. 两阶段处理: 区分初始化和运行阶段，
+        2. 灵活的容量管理: 支持记忆的填充、截取和动态调整
+        3. 两种丢弃模式: 支持逐层丢弃和统一丢弃
+        4. 设备兼容性: 处理跨设备记忆传递问题
+        """
+
+        # [batch_size, num_layers, num_tokens, hidden_dim] -> [num_layers, num_tokens, hidden_dim]
         if len(delta_memory.shape) == 4:
             delta_memory = delta_memory.detach()[0]
 
+        # 初始化阶段
         if self.initialized == 0:
 
+            # 如果 delta_memory 长度不足，通过重复填充到所需长度
+            # 默认
             if delta_memory.shape[1] < (self.num_tokens * self.num_blocks):
+                # 情况1: 完美整除，直接重复整个 delta_memory
                 if ((self.num_tokens * self.num_blocks) % delta_memory.shape[1]) == 0:
                     delta_memory = torch.cat(
                         [delta_memory] * ((self.num_tokens * self.num_blocks) // delta_memory.shape[1]), dim=1
                     )
+                # 情况2: 需要部分填充，先完整重复尽可能多次，再取尾部的一部分来填满剩余容量。
                 else:
                     delta_memory = torch.cat(
                         [delta_memory] * ((self.num_tokens * self.num_blocks) // delta_memory.shape[1]) + 
                         [delta_memory[:, -((self.num_tokens * self.num_blocks) % delta_memory.shape[1]):]], dim=1
                     )
 
+            # 如果 delta_memory 过长，截取最后部分
             else:
                 delta_memory = delta_memory[:, -self.num_tokens * self.num_blocks:]
 
+            # 直接将 delta_memory 赋值给模型记忆
             self.memory.data = delta_memory
 
+        # 运行阶段
         else:
 
+            # 如果新记忆超过容量，触发调试断点
             if delta_memory.shape[1] > self.num_tokens * self.num_blocks:
                 import ipdb; ipdb.set_trace()
 
+            # 处理单层记忆 (delta_memory.shape[1] == self.num_tokens)
             if delta_memory.shape[1] == self.num_tokens:
 
+                # 逐层丢弃模式 (drop_memory_per_layer=True)，配置默认 True
+                # 默认
                 if self.drop_memory_per_layer:
 
                     for idx in range(len(self.memory)):
+                        # 1. 取出当前层的记忆
                         current_memory = self.memory.data[idx].detach()
+                        # 2. 使用 drop_memory 丢弃部分旧记忆
                         current_memory = self.drop_memory(current_memory, unsequeezed=False)
+                        # 3. 将新记忆与剩余记忆拼接
                         self.memory.data[idx] = torch.cat([current_memory, delta_memory[idx]], dim=0)
 
+                # 将所有层的记忆作为一个整体处理
                 else:
 
+                    # 1. 取出完整记忆
                     current_memory = self.memory.data.detach() # detach might be unnecessary, but just to make sure
                     # current_memory.shape: [L, num_blocks * num_tokens, d]
                     # we need to drop 1/num_blocks current_memories on dimension 1:
                     # current_memory = current_memory.detach().cpu()
+                    # 2. 统一丢弃部分旧记忆
                     current_memory = self.drop_memory(current_memory)
                     # current_memory = current_memory.to(delta_memory.device)
 
@@ -1651,6 +1690,8 @@ class MemoryLLM(LlamaForCausalLM):
                     else:
                         self.memory.data = torch.cat([current_memory, delta_memory], dim=1)
 
+            # 处理多层记忆 (delta_memory.shape[1] > self.num_tokens)
+            # 与上述逻辑类似，但指定了具体的丢弃长度 delta_memory.shape[1]
             else:
                 if self.drop_memory_per_layer:
                     for idx in range(len(self.memory)):
@@ -1673,14 +1714,30 @@ class MemoryLLM(LlamaForCausalLM):
     def cat_memory_and_hiddens(self, idx, hidden_states, delta_memory=None, 
                                is_injection=False,
                                cat_to_maximum_memory=False):
-        
+        """
+        负责将记忆与当前隐藏状态拼接
+
+        参数说明:
+            - idx: 当前处理层的索引
+            - hidden_states: 当前层的隐藏状态
+            - delta_memory: 新的增量记忆（可选）
+            - is_injection: 是否为注入模式
+            - cat_to_maximum_memory: 是否拼接到最大记忆容量
+        """
+
+        # 如果模型还未初始化，直接返回原始隐藏状态，不进行记忆拼接
         if not self.initialized:
             return hidden_states
     
+        # 场景1: 无delta_memory或空记忆
         if delta_memory is None or len(delta_memory) == 0:
 
+            # 注入模式 (is_injection=True): 只取最后 num_tokens 个记忆
+            # 默认（is_injection=True and delta_memory is None）
             if is_injection:
+                # [num_tokens, hidden_dim] -> [1, num_tokens, hidden_dim] -> [batch_size, num_tokens, hidden_dim]
                 cur_memory = self.memory[idx][ - self.num_tokens:].unsqueeze(0).repeat(len(hidden_states), 1, 1)
+            # 普通模式 (is_injection=False): 取全部记忆
             else:
                 cur_memory = self.memory[idx].unsqueeze(0).repeat(len(hidden_states), 1, 1)
             
@@ -1688,16 +1745,21 @@ class MemoryLLM(LlamaForCausalLM):
             if cur_memory.device != hidden_states.device:
                 cur_memory = cur_memory.to(hidden_states.device)
 
+        # 场景2: 有delta_memory
         else:
 
+            # 从 delta_memory 中取出当前层的记忆，形状为 [batch_size, num_tokens, hidden_dim]
             cur_memory = delta_memory[:, idx]
             
+            # 注入模式下，确保记忆长度等于 num_tokens
             if is_injection:
 
                 assert cur_memory.shape[1] == self.num_tokens
 
+            # 默认（is_injection=False and delta_memory is not None）
             else:
 
+                # 处理长记忆 (delta_memory.shape[2] > self.num_tokens)
                 if delta_memory.shape[2] > self.num_tokens:
 
                     old_memory = self.memory[idx].detach().unsqueeze(0).repeat(len(hidden_states), 1, 1) # detach might be unnecessary, but just to make sure
@@ -1706,17 +1768,21 @@ class MemoryLLM(LlamaForCausalLM):
                     if old_memory.device != hidden_states.device:
                         old_memory = old_memory.to(hidden_states.device)
 
+                    # 随机采样旧记忆
                     # randomly sample (old_memory.shape[1] - cur_memory.shape[1]) from old_memory
                     sampled_indices = torch.randperm(old_memory.shape[1])[:old_memory.shape[1] - cur_memory.shape[1]]
                     # sort sampled_indices to make sure it is in ascending order
                     sampled_indices = sampled_indices.sort()[0]
                     old_memory = old_memory[:, sampled_indices, :]
 
+                    # 拼接旧记忆和新记忆
                     cur_memory = torch.cat([
                         old_memory,
                         cur_memory,
                     ], dim=1)
 
+                # 等长记忆的特殊处理
+                # 当新记忆长度等于 num_tokens 且启用 cat_to_maximum_memory 时的特殊处理逻辑
                 if delta_memory.shape[2] == self.num_tokens and cat_to_maximum_memory:
                     # we need to cat the memory when there is only one context
                     old_memory = self.memory[idx].detach().unsqueeze(0).repeat(len(hidden_states), 1, 1) # detach might be unnecessary, but just to make sure
@@ -1742,6 +1808,7 @@ class MemoryLLM(LlamaForCausalLM):
             else:
                 cur_memory = torch.cat([self.bos_embedding[idx].unsqueeze(0).repeat(len(cur_memory), 1, 1), cur_memory], dim=1)
 
+        # 将记忆与隐藏状态拼接
         return torch.cat([cur_memory, hidden_states], dim=1)
     
     def forward(
@@ -1762,6 +1829,10 @@ class MemoryLLM(LlamaForCausalLM):
         is_injection: Optional[bool] = None,
         cat_to_maximum_memory: Optional[bool] = False,
     ) -> Union[Tuple, MemoryLMOutputWithPastAndCrossAttentions]:
+        """
+        在处理每个token时都考虑到相关的历史记忆，实现了真正的"记忆增强"语言模型能力
+        """
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1769,6 +1840,7 @@ class MemoryLLM(LlamaForCausalLM):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # 当 output_delta_memory=True 时，会自动启用注入模式。
         if is_injection is None:
             is_injection = output_delta_memory
 
@@ -1864,19 +1936,25 @@ class MemoryLLM(LlamaForCausalLM):
                         # module._active_adapter = ['default', 'decoder_adapter']
                         module._active_adapter = ['decoder_adapter']
 
+        # 遍历模型的每一层解码器
         for idx, decoder_layer in enumerate(self.model.layers):
             
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             
+            # 只有当没有缓存或缓存为空时，才需要拼接记忆
             if past_key_values is None or past_key_values.get_seq_length(layer_idx=idx) == 0:
 
+                # 条件1: 注入模式或记忆未分离
                 if is_injection or (not self._detach_memory):
+                    # cat_memory_and_hiddens 方法，将记忆与隐藏状态拼接
+                    # 只有 is_injection 模式下，才会传入 delta_memory
                     hidden_states = self.cat_memory_and_hiddens(idx,
                                                     hidden_states=hidden_states,
                                                     delta_memory=delta_memory,
                                                     is_injection=is_injection,
                                                     cat_to_maximum_memory=cat_to_maximum_memory)
+                # 记忆分离模式
                 else:
                     hidden_states = torch.cat([
                         self.bos_embedding[idx].unsqueeze(0).repeat(len(hidden_states), 1, 1),
@@ -1885,9 +1963,11 @@ class MemoryLLM(LlamaForCausalLM):
                 
                 prefix_token_length = hidden_states.shape[1] - inputs_embeds.shape[1] if self.initialized else 0
 
+                # 注入模式特殊处理：前缀长度限制
                 if is_injection and prefix_token_length > 0:
                     prefix_token_length = min(prefix_token_length, hidden_states.shape[1] - self.num_tokens)
 
+                # 注入模式下，添加新的记忆位置嵌入
                 if is_injection:
                     if self.new_memory_positional_emb.device != hidden_states.device:
                         hidden_states[:, -self.num_tokens:] += self.new_memory_positional_emb.to(hidden_states.device)
@@ -1925,18 +2005,24 @@ class MemoryLLM(LlamaForCausalLM):
                 )
 
             hidden_states = layer_outputs[0]
+
+            # 模型会收集每一层输出的最后 self.num_tokens 个token的隐藏状态作为新的记忆增量。
             if output_delta_memory:
                 all_delta_memory.append(hidden_states[:, -self.num_tokens:])
+            # 将隐藏状态截取回原始输入长度，移除前面拼接的记忆部分，只保留对应当前输入的隐藏状态
             hidden_states = hidden_states[:, -input_ids.shape[1]:]
 
+            # 如果启用缓存，从解码器输出中提取键值对缓存
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
 
+            # 如果需要输出注意力权重，收集注意力信息
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
             
         hidden_states = self.model.norm(hidden_states)
             
+        # 增量记忆收集
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -1945,6 +2031,7 @@ class MemoryLLM(LlamaForCausalLM):
         if return_legacy_cache:
             next_cache = next_cache.to_legacy_cache()
 
+        # 增量记忆组装：将所有层的 delta_memory 堆叠成一个张量，形状变为 [batch_size, num_layers, num_tokens, hidden_dim]
         if output_delta_memory:
 
             if all_delta_memory[0].device != all_delta_memory[-1].device:
@@ -1965,7 +2052,9 @@ class MemoryLLM(LlamaForCausalLM):
         logits = logits.float()
 
         loss = None
+        # 标准语言建模损失
         if labels is not None:
+            # 将 logits 和 labels 错位一个位置（第n个token预测第n+1个token）
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()

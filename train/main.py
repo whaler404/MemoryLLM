@@ -753,6 +753,7 @@ if __name__ == '__main__':
         # run
         if opt.train:
             try:
+                # 训练入口
                 trainer.fit(model, data)
             except Exception:
                 melk()

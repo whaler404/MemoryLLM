@@ -446,14 +446,24 @@ class LlamaAttention(nn.Module):
             value_states = torch.cat(value_states, dim=-1)
 
         else:
+            #   [BOS] + [LTM tokens] + [STM tokens] + [Current tokens]
+            #     0    1:1+ltm_length    1+ltm_length:prefix_token_length    prefix_token_length:
+            # query_states: [batch, sequence - prefix_tokens, heads * head_dim]
             query_states = self.q_proj(hidden_states[:, prefix_token_length:])
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
 
+        # 记忆检索器机制 (Retriever Mechanism)
         if self.add_selector and output_retriever_weights:
             if self.config.map_from_hidden_states:
+                # 从隐藏状态中分离出查询和键（默认）
+                # hidden_states: [batch, sequence, hidden]
                 if self.detach_hidden_state:
+                    # queries: [batch, sequence - prefix_tokens, selector]
+                    # queries: [batch, current_tokens, selector]
                     queries = self.query_proj(hidden_states[:, prefix_token_length:].detach())
+                    # keys: [batch, prefix_tokens - 1 - ltm_tokens, selector]
+                    # keys: [batch, stm_tokens, selector]
                     keys = self.key_proj(hidden_states[:, 1+ltm_length:prefix_token_length].detach())
                 else:
                     queries = self.query_proj(hidden_states[:, prefix_token_length:])
@@ -465,6 +475,9 @@ class LlamaAttention(nn.Module):
                 else:
                     queries = self.query_proj(query_states)
                     keys = self.key_proj(key_states[:, 1+ltm_length:prefix_token_length])
+            # 计算检索权重
+            # retriever_weights: [batch, current_tokens, stm_tokens]
+            # retriever_weights.mean(1): [batch, stm_tokens]
             retriever_weights = torch.sigmoid(torch.matmul(queries, keys.transpose(1, 2)))
 
         else:
@@ -510,7 +523,12 @@ class LlamaAttention(nn.Module):
             attn_weights.masked_fill_(~causal_mask, torch.finfo(attn_weights.dtype).min)
 
         # add retriever_weights on attn_weights
+        # 注意力权重调制 (Attention Weight Modulation)
+        # 下面 tensor 没有对其，可能是 apply_retriever_weights 默认为 False 没起作用
         if self.add_selector and output_retriever_weights and apply_retriever_weights:
+            # 只修改记忆部分的注意力权重（跳过当前查询部分），对数空间调制，添加1e-5防止log(0)的数值问题
+            # attn_weights: [batch, heads, current_tokens, lsm_tokens + stm_tokens]
+            # retriever_weights: [batch, current_tokens, stm_tokens]
             attn_weights[:, :, :, 1:prefix_token_length] = attn_weights[:, :, :, 1:prefix_token_length] + torch.log(retriever_weights.unsqueeze(1) + 1e-5)
 
         # upcast attention to fp32
@@ -975,7 +993,8 @@ class LlamaDecoderLayer(nn.Module):
 
         if use_cache:
             outputs += (present_key_value,)
-        
+
+        # retriever_weights: [batch, current_tokens, stm_tokens]
         if encoder_query_indices is None:
             outputs += (retriever_weights, )
         else:
@@ -1857,10 +1876,15 @@ class MPlus(LlamaForCausalLM):
                 get_peft_model(self.model, peft_config, adapter_name="decoder_adapter")
 
         # LTM parameters
+        # [num_layers, ltm_initial_size, hidden_dim] 存储各层的长期记忆向量，类似于模型的"永久知识库"
         self.ltm = nn.ParameterList([nn.Parameter(torch.randn([config.ltm_initial_size, self.d])) for _ in range(self.L)])
+        # [num_layers, ltm_initial_size, selector_hidden_dim] 当需要检索相关记忆时，将当前状态映射到相同维度空间，与这些键计算相似度
         self.ltm_keys = nn.ParameterList([nn.Parameter(torch.randn([config.ltm_initial_size, config.selector_hidden_dim])) for _ in range(self.L)])
+        # [num_layers, ltm_initial_size] 记录每个LTM记忆项被检索的频率，类似于 LRU
         self.ltm_recall_frequencies = nn.ParameterList([nn.Parameter(torch.zeros([config.ltm_initial_size])) for _ in range(self.L)])
+        # [num_layers, ltm_initial_size] 记录每个LTM记忆项的年龄
         self.ltm_ages = nn.ParameterList([nn.Parameter(torch.zeros([config.ltm_initial_size])) for _ in range(self.L)])
+        # [num_layers, num_blocks * num_tokens] 跟踪短期记忆（STM）中每个记忆项的年龄
         self.memory_ages = [np.zeros([self.num_blocks * self.num_tokens]) for _ in range(self.L)]
         self.put_cached_dropped_memory_on_cpu = True
 
@@ -1913,16 +1937,24 @@ class MPlus(LlamaForCausalLM):
 
             if retriever_weights is not None:
 
+                # retriever_weights: [batch, stm_tokens]
+                # 将重要记忆（权重 > 0.5）标记为保留，不重要记忆标记为可能丢弃
                 retriever_labels = retriever_weights[idx] > 0.5
                 remaining_indices = torch.where(retriever_labels == 1)[0]
 
+                # 容量平衡算法
+                # len(retriever_labels) - len(remaining_indices): 当前不重要记忆的数量
+                # diff: 如果新记忆数量超过了不重要记忆的容量，需要额外丢弃一些重要记忆
                 diff = delta_memory.shape[1] - (len(retriever_labels) - len(remaining_indices))
                 if diff > 0:
+                    # stm_tokens > delta_memory_tokens ，所以 stm 除了丢掉不重要记忆外，还需要从重要记忆中随机丢掉 diff 个
+                    # 保证刚好丢掉 delta_memory.shape[1] 个记忆
                     retriever_labels[remaining_indices[:diff]] = False
                     remaining_indices = torch.where(retriever_labels == 1)[0]
                 
                 indices_to_drop = torch.where(retriever_labels == 0)[0]
                 # randomly drop delta_memory.shape[1] indices in indices_to_drop
+                # 随机选择保留策略，从不重要记忆中随机选择足够的数量来填补剩余空间
                 remaining_indices = torch.cat([
                     remaining_indices,
                     indices_to_drop[torch.randperm(len(indices_to_drop))[:len(indices_to_drop) - delta_memory.shape[1]]]
@@ -1974,6 +2006,25 @@ class MPlus(LlamaForCausalLM):
 
                 else:
                     
+                    # 短期记忆的记忆年龄管理部分
+                    # 完整流程示例
+
+                    # 假设：
+                    # - current_memory: 有10个token，年龄为 [9,8,7,6,5,4,3,2,1,0]
+                    # - remaining_indices: [0,2,4,6,8] (保留5个记忆)
+                    # - delta_memory: 新增4个token
+
+                    # 年龄更新过程：
+
+                    # # 1. 保留记忆的年龄
+                    # preserved_ages = [9,7,5,3,1]  # 索引0,2,4,6,8对应的年龄
+
+                    # # 2. 新记忆的年龄
+                    # new_ages = [3,2,1,0]  # 逆序排列
+
+                    # # 3. 合并后的年龄数组
+                    # final_ages = [9,7,5,3,1,3,2,1,0]  # 总共9个记忆
+
                     # np.array([1,2,3])[torch.tensor([2])] gives 3
                     # np.array([1,2,3])[np.array([2])] gives [3], we need the latter one
                     remaining_indices = np.array(remaining_indices)
@@ -2031,6 +2082,9 @@ class MPlus(LlamaForCausalLM):
                                         dropped_delta_memory=None,
                                         dropped_delta_memory_ages=None):
         
+        # 1. 年龄计算与初始化
+        # delta_memory_ages:         [layers, num_tokens]
+        # dropped_delta_memory_ages: [layers, dropped_count]
         if delta_memory_ages is not None and dropped_delta_memory_ages is not None:
             if dropped_delta_memory_ages.shape[1] > 0:
                 max_delta_memory_age = max(delta_memory_ages.max().item(), dropped_delta_memory_ages.max().item())
@@ -2040,6 +2094,8 @@ class MPlus(LlamaForCausalLM):
             max_delta_memory_age = None
         
         # call the update_memory_with_delta_memory function from the base class
+        # 2. 基础记忆更新
+        # 短期记忆的更新， ltm 更新模式需要对 age进行处理
         outputs = self.base_update_memory_with_delta_memory(
                                     delta_memory, 
                                     cached_contexts_indicators, 
@@ -2050,6 +2106,7 @@ class MPlus(LlamaForCausalLM):
 
         ages_to_add = self.num_tokens if max_delta_memory_age is None else 1 + max_delta_memory_age
 
+        # 3. 全局年龄更新
         for idx in range(self.L):
             self.ltm_ages[idx] += ages_to_add
 
@@ -2072,10 +2129,12 @@ class MPlus(LlamaForCausalLM):
         if isinstance(dropped_memories, list):
             dropped_memories = torch.stack(dropped_memories)
 
+        # 默认
         if self.update_step == 0:
 
             with torch.no_grad():
                 cached_dropped_keys = []
+                # 计算丢弃记忆的键表示，用于后续的 LTM 更新
                 for idx in range(self.L):
                     cached_dropped_keys.append(
                         self.model.layers[idx].self_attn.key_proj(
@@ -2132,6 +2191,7 @@ class MPlus(LlamaForCausalLM):
 
         self.update_step += ages_to_add
 
+        # 4. 批量更新触发
         if self.update_step >= self.update_ltm_frequency * self.num_tokens:
             self.merge_cached_memory()
         
@@ -2146,6 +2206,7 @@ class MPlus(LlamaForCausalLM):
 
         ltm_indices = None
 
+        # 生成模式下，或者没有提供delta_memory时，才会将长期记忆（LTM）与当前隐藏状态拼接
         if (not is_injection) and (delta_memory is None or cat_to_maximum_memory):
             ltm, ltm_indices = self.get_ltm(idx, hidden_states, random_retriever_length=random_retriever_length)
             hidden_states = torch.cat([
@@ -2154,6 +2215,7 @@ class MPlus(LlamaForCausalLM):
                 hidden_states
             ], dim=1)
 
+        # 注入模式下，或者提供了delta_memory时，只拼接短期记忆（STM）
         else:
             hidden_states = torch.cat([stm, hidden_states], dim=1)
 
@@ -2324,6 +2386,9 @@ class MPlus(LlamaForCausalLM):
             if past_key_values is None or past_key_values.get_seq_length(layer_idx=idx) == 0:
 
 
+                # 这部分和 MemoryLLM 一致
+                # cat_memory_and_hiddens 方法，将记忆与隐藏状态拼接
+                # 只有 is_injection 模式下，才会传入 delta_memory
                 hidden_states, ltm_indices = self.cat_memory_and_hiddens(idx,
                                                 hidden_states=hidden_states,
                                                 delta_memory=delta_memory,
@@ -2333,6 +2398,7 @@ class MPlus(LlamaForCausalLM):
 
                 all_ltm_indices += (ltm_indices,)
                 
+                # prefix_token_length: 1 + num_memory_tokens
                 prefix_token_length = hidden_states.shape[1] - inputs_embeds.shape[1] if self.initialized else 0
 
                 if is_injection and prefix_token_length > 0:
@@ -2364,6 +2430,8 @@ class MPlus(LlamaForCausalLM):
                 
             else:
                 
+                # output_retriever_weights 控制是否输出检索权重，默认是 False
+                # retriever_weights: [batch, stm_tokens]
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask,
@@ -2505,6 +2573,7 @@ class MPlus(LlamaForCausalLM):
             return current_memory
 
     # The followings are the functions for long-term memory
+    # 这部分就是 MemoryLLM 的 cat_memory_and_hiddens 获取 current_memory 的部分
     def get_stm(self, 
                 idx,
                 hidden_states,
@@ -2542,17 +2611,21 @@ class MPlus(LlamaForCausalLM):
 
         num_ltm_tokens = self.num_ltm_tokens if hasattr(self, "num_ltm_tokens") else self.num_ltm_blocks * self.num_tokens
 
+        # 初始化阶段：键的计算与缓存
         # get ltm_keys if ltm_keys are None
+        # LTM 键计算 (Lazy Initialization)
         if self.ltm_keys[idx] is None:
 
             with torch.no_grad():
 
+                # ltm: [ltm_count, hidden]
                 ltm = self.ltm[idx]
                 tmp_ltm_keys = []
                 batch_size = 64
 
                 for batch_ltm in torch.split(ltm, batch_size):
                     batch_ltm = batch_ltm.to(hidden_states.device).to(hidden_states.dtype)
+                    # ltm_keys: [64, selector]
                     ltm_keys = self.model.layers[idx].self_attn.key_proj(self.model.layers[idx].input_layernorm(batch_ltm))
                     tmp_ltm_keys.append(ltm_keys)
                 tmp_ltm_keys = torch.cat(tmp_ltm_keys, dim=0)
@@ -2574,17 +2647,32 @@ class MPlus(LlamaForCausalLM):
             
             else:
                 
+                # LTM检索 (核心分支)
+                # 1. 查询计算
                 if random_retriever_length:
                     length = torch.randint(1, hidden_states.size(1), (1,)).item()
                     hidden_states = hidden_states[:, :length, :]
 
+                # queries: [sequence, selector]
                 queries = self.model.layers[idx].self_attn.query_proj(self.model.layers[idx].input_layernorm(hidden_states[0]))
+                # 2 LTM检索预测
+
+                # 详细Shape分析：
+                # queries:                     [sequence, selector]
+                # self.ltm_keys[idx]:          [ltm_count, selector]
+                # lta_keys.transpose(-2, -1):  [selector, ltm_count]
+                # queries @ lta_keys.transpose: [sequence, ltm_count]
+                # sigmoid(...):               [sequence, ltm_count]
+                # mean(dim=0):                [ltm_count]
+                # 平均聚合: 所有查询对每个LTM项的平均重要性
                 predictions = (queries @ self.ltm_keys[idx].to(queries.device).transpose(-2, -1)).sigmoid().mean(dim=0)
 
                 if self.cached_dropped_memories is not None:
                     cached_predictions = (queries @ self.cached_dropped_keys[idx].to(queries.device).transpose(-2, -1)).sigmoid().mean(dim=0)
                     predictions = torch.cat([predictions, cached_predictions], dim=0)
 
+                # 3. Top-K选择
+                # predictions: [total_memory_count]
                 indices = torch.topk(predictions, k=num_ltm_tokens).indices
                 indices = torch.sort(indices)[0].cpu()
 
@@ -2592,6 +2680,7 @@ class MPlus(LlamaForCausalLM):
             ages = self.ltm_ages[idx][indices.detach().cpu()]
             indices = indices[np.argsort(ages)[::-1].copy()]
             x = self.ltm[idx][indices.detach().cpu()].to(hidden_states.device)
+            # retrieved_ltm: [num_ltm_tokens, hidden]
             return x.detach(), indices.detach().cpu()
         
         else:
@@ -2628,17 +2717,22 @@ class MPlus(LlamaForCausalLM):
     
     def update_ltm(self, dropped_memories=None, dropped_memory_ages=None, device=None, cached_dropped_keys=None):
 
+        # 代码中大量使用了 no_grad 和 detach ，以确保在更新长期记忆时不会影响梯度计算
         with torch.no_grad():
 
             # update ltm according to memory_recall_frequency
+            # STM → (丢弃) → LTM转入 → (频率衰减) → LTM淘汰
             for idx in range(len(self.memory)):
 
+                # 1. current_memory - 从 STM 中丢弃的记忆
                 current_memory = dropped_memories[idx]
+                # 将 STM 记忆转移到 LTM
                 self.ltm[idx] = torch.cat([
                     self.ltm[idx],
                     current_memory.detach().cpu()
                 ])
                 assert self.initial_rf_when_moving_stm_to_ltm is not None
+                # 2. 重复调用频率初始化 (Recall Frequency Initialization)
                 self.ltm_recall_frequencies[idx] = np.concatenate(
                     [self.ltm_recall_frequencies[idx],
                     np.ones(current_memory.shape[0]) * self.initial_rf_when_moving_stm_to_ltm]
@@ -2662,12 +2756,16 @@ class MPlus(LlamaForCausalLM):
                         ).detach().cpu()
                     ])
 
+                # 3. 记忆年龄转移 (Memory Age Transfer)，LTM记忆继承其在STM时的年龄，保持记忆时间线的一致性
                 self.ltm_ages[idx] = np.concatenate([
                     self.ltm_ages[idx].astype(int),
                     dropped_memory_ages[idx]
                 ])
 
+                # 4. 频率衰减 (Frequency Decay)
                 self.ltm_recall_frequencies[idx] -= self.decay_frequency
+                # 5. 记忆淘汰 (Memory Pruning)
+                # 只保留回忆频率 > 0.01 的记忆
                 indices = np.where(self.ltm_recall_frequencies[idx] > 0.01)[0] # sometimes it may be "2.0539126e-15", using 0.01 to filter out these cases
                 if len(indices) > self.num_ltm_blocks * self.num_tokens:
                     self.ltm[idx] = self.ltm[idx][indices]

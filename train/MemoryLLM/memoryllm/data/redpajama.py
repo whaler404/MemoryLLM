@@ -69,10 +69,29 @@ class RedPajamaDataset(IterableDataset):
         # take a pass over all the data to get the meta information
 
     def get_context_and_sentence(self, doc, return_doc=False):
+        """
+        将单个文档分割成上下文(contexts)和目标句子(sentence)，为 MemoryLLM 的记忆训练准备数据
+
+          输入文档: "The quick brown fox jumps over the lazy dog. Python is a programming language..."
+
+        正常模式输出:
+        - contexts: [tokens_1, tokens_2, ...] (前面的部分)
+        - sentence: [tokens_last] (最后部分)
+        - label: 1 (相关上下文)
+
+        上下文目标模式输出:
+        - contexts: [tokens_1, tokens_2, ...] (组合上下文)
+        - sentence: tokens_selected (随机选择)
+        - label: 0 或 2 (根据选择策略)
+        """
+        # 1. 方法核心功能
         
+        # 2. 输入处理
         # tokenizer doc:
         doc = self.tokenizer(doc + self.end_special_token, return_tensors='pt', truncation=False, add_special_tokens=False).input_ids[0]
 
+        # 3. 特殊返回模式
+        # 用于验证场景，直接返回整个文档作为单个上下文
         if return_doc:
             doc = doc[:self.max_length]
             attention_masks = torch.ones(self.num_tokens + len(doc))
@@ -80,11 +99,17 @@ class RedPajamaDataset(IterableDataset):
 
         # get the context and sentence:
 
+        # 4. 两种核心数据生成模式
+
+        # 4.1 上下文目标模式 (target_is_context=True) - Sanity Check
+        # 用途: 用于验证模型性能的对照实验
         if self.target_is_context:
             # For Sanity Check Experiments
+            # 短文档处理：简单二分
             if len(doc) < self.max_length / 2 + self.min_length / 2:
                 index = len(doc) // 2
                 contexts = [doc[:index], doc[index:]]
+            # 长文档处理：滑动窗口分割
             else:
                 contexts = []
                 while len(doc) >= self.max_length / 2:
@@ -95,13 +120,16 @@ class RedPajamaDataset(IterableDataset):
                     contexts.append(doc)
 
             if self.overlap_contexts:
+                # # 创建重叠上下文: [0:1], [1:2], [2:3]...
                 contexts = [torch.cat([contexts[i], contexts[i+1]]) for i in range(len(contexts) - 1)]
             else:
                 if len(contexts) == 1:
                     pass
                 else:
+                # # 创建配对上下文: [0:1], [2:3], [4:5]...
                     contexts = [torch.cat([contexts[i*2], contexts[i*2+1]]) for i in range(len(contexts) // 2)]
 
+            # 随机选择目标句子
             if self.shuffle_first_context:
                 if np.random.rand() > 0.5:
                     sentence = contexts[0]
@@ -113,6 +141,8 @@ class RedPajamaDataset(IterableDataset):
                 sentence = contexts[0]
                 label = 0
 
+        # 4.2 正常训练模式 (target_is_context=False) - Standard Training
+        # 用途: 标准的记忆增强训练
         else:
             label = 1
             # Normal Training Path
@@ -127,16 +157,20 @@ class RedPajamaDataset(IterableDataset):
                     doc = doc[context_length:] 
                 if len(doc) >= self.min_length:
                     contexts.append(doc)
+            # 最后一个片段作为目标句子
             sentence = contexts[-1]
+            # 前面的所有片段作为上下文
             contexts = contexts[:-1]
         
         assert len(contexts) > 0
 
         base_attention_masks = torch.ones(self.num_tokens)
 
+        # Shape: [[num_tokens + context_length]]
         contexts_masks = [
             torch.cat([base_attention_masks, torch.ones(len(context_ids))]) for context_ids in contexts
         ]
+        # Shape: [num_tokens + sentence_length]
         sentence_mask = torch.cat([base_attention_masks, torch.ones(len(sentence))])
         if self.target_is_context:
             return contexts, contexts_masks, sentence, sentence_mask, label

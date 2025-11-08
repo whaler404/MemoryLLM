@@ -4,3 +4,5 @@ train/data/redpajama/documents
 train/data/redpajama/listings
 train/logs
 locals
+
+.claude

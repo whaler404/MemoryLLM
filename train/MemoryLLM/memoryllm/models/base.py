@@ -123,7 +123,20 @@ class BaseMemoryModelPL(pl.LightningModule):
             return self.adjust_weight_strategy.get_weight()
     
     def training_step(self, batch, batch_idx):
+        """
+        增量记忆注入和上下文学习
+        - 多上下文记忆注入：将多个上下文信息逐步注入模型记忆
+        - 动态权重调整：根据上下文数量和类型调整损失权重
+        - 记忆缓存策略：支持长上下文的数据缓存机制
+        - 正负样本训练：处理相关和不相关上下文的混合训练
+        """
+        # 1. 方法核心功能概述
 
+        # 2. 输入数据处理
+
+        # contexts_ids: 多个上下文的 token ID 序列
+        # sentence_ids: 目标句子的 token ID 序列
+        # labels: 标签 (0=不相关上下文, 1=相关上下文, 2=第二部分上下文)
         if len(batch) == 5:
             contexts_ids, contexts_attention_masks, sentence_ids, sentence_attention_masks, labels = batch
         else:
@@ -135,10 +148,16 @@ class BaseMemoryModelPL(pl.LightningModule):
                 contexts_ids, contexts_attention_masks, sentence_ids, sentence_attention_masks, labels = batch
 
         additional_kwargs = {}
+
+        # 3. 核心训练流程
+
+        # 3.1 记忆比例调整
         if self.adjust_memory_ratio_strategy is not None:
             additional_kwargs['memory_ratio'] = self.adjust_memory_ratio_strategy.get_weight(self.trainer.global_step)
 
+        # 3.2 缓存数据处理
         skip_injection = False
+        # 当启用 cache_data_for_longer_context 时，默认 False
         if self.cache_data_for_longer_context:
             
             if self.cat_and_drop_memory:
@@ -168,14 +187,19 @@ class BaseMemoryModelPL(pl.LightningModule):
                     sentence_attention_masks = self.cached_sentence_masks
                     skip_injection = True
 
+        # 默认
         if not skip_injection:
 
             if self.num_contexts_schedule is not None:
 
+                # 3.3 动态上下文数量调度
+                # 根据训练步骤动态调整使用的上下文数量
                 num_of_contexts = self.num_contexts(self.trainer.global_step)
 
+                # 列表式调度
                 if isinstance(self.num_contexts_schedule, list):
                     checkpoints = self.num_contexts_schedule
+                # 字典式调度
                 else:
                     checkpoints = self.num_contexts_schedule['checkpoints']
 
@@ -201,16 +225,20 @@ class BaseMemoryModelPL(pl.LightningModule):
                 else:
                     num = min(num_of_contexts, len(contexts_ids))
 
+                # 权重计算策略
                 # determine the weight for loss
                 # num = 1: means it's there is only one context, so we don't need weight
                 # num != 1 and num != num_of_contexts: means it's in the middle of the contexts, so we use the stable weight
                 # num == num_of_contexts: means it's the last context, so we use the negative weight
+                # num == 1: 权重 = 1 (单上下文，无需调整)
                 if num == 1:
                     weight = 1
                     update_negative_weight = True if num_of_contexts > 1 else False
+                # num == num_of_contexts: 权重 = negative_weight (最后上下文)
                 elif num == num_of_contexts:
                     weight = self.negative_weight
                     update_negative_weight = False
+                # 中间情况: 使用 stable_weights 中保存的稳定权重
                 else:
                     # now assume num_of_contets = 3 and num = 2; that means we are at step 10000 - 15000
                     # then we would self.stable_weights[2], which makes sense
@@ -223,16 +251,20 @@ class BaseMemoryModelPL(pl.LightningModule):
 
                 num_of_contexts = num
 
+                # 3.4 上下文切片策略
+                # label = 0: 切除末尾部分 → contexts_ids[:num_of_contexts]
                 if labels[0] == 0:
                     # cut the end of the contexts    
                     contexts_ids = contexts_ids[:num_of_contexts]
                     if not self.remove_attention:
                         contexts_attention_masks = contexts_attention_masks[:num_of_contexts]
+                # label = 1: 切除开头部分 → contexts_ids[-num_of_contexts:]
                 elif labels[0] == 1:
                     # cut the beginning of the contexts
                     contexts_ids = contexts_ids[-num_of_contexts:]
                     if not self.remove_attention:
                         contexts_attention_masks = contexts_attention_masks[-num_of_contexts:]
+                # label = 2: 切除第二个部分 → 处理句子分片情况
                 elif labels[0] == 2:
                     # it means the sentence is the second part of the contexts
                     if num_of_contexts == 1 and len(contexts_ids) > 1:
@@ -274,6 +306,8 @@ class BaseMemoryModelPL(pl.LightningModule):
                     if not self.remove_attention:
                         contexts_attention_masks = contexts_attention_masks[-num_of_contexts:]
             
+            # 3.5 记忆注入机制
+            # cat_and_drop_memory=True (连接-丢弃模式)
             if self.cat_and_drop_memory:
 
                 if len(contexts_ids) > 1:
@@ -293,6 +327,8 @@ class BaseMemoryModelPL(pl.LightningModule):
 
                     for i in context_indices:
 
+                        ## 注入阶段 - 写入记忆
+                        # output_delta_memory=True 记忆注入阶段需要获取增量记忆
                         output = self.model(input_ids=contexts_ids[i],
                                             attention_mask=contexts_attention_masks[i] if not self.remove_attention else None,
                                             output_delta_memory=True,
@@ -332,7 +368,8 @@ class BaseMemoryModelPL(pl.LightningModule):
                                         is_injection=True)
 
                     delta_memory = output.delta_memory
-
+            # cat_and_drop_memory=False (增量更新模式)
+            # 默认
             else:
 
                 if len(contexts_ids) > 1:
@@ -341,6 +378,20 @@ class BaseMemoryModelPL(pl.LightningModule):
                                             attention_mask=contexts_attention_masks[i] if not self.remove_attention else None,
                                             output_delta_memory=True,
                                             is_injection=True,)
+                        # delta_memory 从计算图分离
+                        # 1. 防止梯度爆炸/消失：梯度会通过多个记忆更新步骤传播
+                        # 2. 稳定记忆更新：每个记忆更新都是"一步到位"，不会受到后续步骤的影响
+                        # 3. 减少计算负担：切断不必要的梯度传播路径
+
+                        #   contexts_ids → Model → delta_memory → update_memory → Model → loss
+                        #        ↑                                              ↓
+                        #        └─────────────── 梯度回流 ──────────────────────┘
+
+                        #   使用 detach 后:
+
+                        #   contexts_ids → Model → delta_memory ──✂️(切断)──→ update_memory → Model → loss
+                        #        ↑                                              ↓
+                        #        └────── 梯度只到这里，不再传播到记忆更新 ───────┘
                         self.model.update_memory_with_delta_memory(output.delta_memory.detach())
                 
                 output = self.model(input_ids=contexts_ids[-1],
@@ -363,17 +414,23 @@ class BaseMemoryModelPL(pl.LightningModule):
 
                 self.nuc_length += 1
 
+        # 3.6 目标句子处理
         sentence_labels = sentence_ids.clone()
+        # 只有在使用注意力机制时才执行标签处理
         if not self.remove_attention:
+            # -100 是CrossEntropyLoss 的 ignore_index 默认值，训练时会忽略这些位置的损失计算
             sentence_labels[sentence_attention_masks[:, self.model.num_tokens:] == 0] = -100
 
+        # 默认
         if not skip_injection:
             if self.cat_memories:
+                # 当 delta_memory.shape[2] > self.model.num_tokens 时，扩展注意力掩码
                 if delta_memory.shape[2] > self.model.num_tokens:
                     sentence_attention_masks = torch.cat([
                                 torch.ones(sentence_attention_masks.shape[0], delta_memory.shape[2] - self.model.num_tokens).to(sentence_attention_masks.device),
                                 sentence_attention_masks,
                             ], dim=1)
+                # 支持 detach_additional_memory 来分离部分记忆梯度
                 if self.detach_additional_memory and len(contexts_ids) > 1:
                     additional_kwargs['detach_indices'] = detach_indices
             
@@ -417,18 +474,25 @@ class BaseMemoryModelPL(pl.LightningModule):
                             sentence_attention_masks,
                         ], dim=1)
         
+        # 3.7 最终前向传播
+        ## 生成阶段 - 读取记忆
         output = self.model(input_ids=sentence_ids,
                 attention_mask=sentence_attention_masks if not self.remove_attention else None,
                 labels=sentence_labels,
+                # 增加记忆变更输入
                 delta_memory=delta_memory,
                 output_delta_memory=False,
                 is_injection=False,
                 return_dict=True, **additional_kwargs)
 
+        # 4. 损失计算和权重调整
         loss = output['loss']
 
         loss *= weight
 
+        # 5. 日志记录系统
+
+        # 5.1 基础损失: loss/related_c_{num} 或 loss/unrelated_c_{num}
         if not self.cat_and_drop_memory and self.regularization_scheduler is not None:
             regularization_loss, m0_norm, difference_norm = self.regularization_scheduler.get_regularization_loss(self.model.memory.detach(), delta_memory)
             self.log_dict({'loss/regularization': regularization_loss}, logger=True, on_step=True)
@@ -437,6 +501,7 @@ class BaseMemoryModelPL(pl.LightningModule):
         else:
             regularization_loss = 0
 
+        # 5.2 权重监控: nw/weight, nw/cur_loss
         if update_negative_weight:
             if self.adjust_weight_strategy is not None:
                 self.adjust_weight_strategy.update_weight(loss / weight)
@@ -450,6 +515,7 @@ class BaseMemoryModelPL(pl.LightningModule):
 
         if self.cache_data_for_longer_context:
 
+            # 5.3 缓存指标: 当使用缓存时记录 loss/unrelated_nuc
             if indicator == 1:
                 # self.log_dict({'loss/unrelated_c_{}'.format(self.nuc_length): loss / weight}, logger=True, on_step=True)
                 self.log_dict({'loss/unrelated': (loss) / weight}, logger=True, on_step=True)
@@ -484,6 +550,27 @@ class BaseMemoryModelPL(pl.LightningModule):
 
                 else:
                     self.log_dict({'loss/{}_c_{}'.format("related" if labels[0] == 1 else "unrelated", len(contexts_ids)): loss / weight}, logger=True, on_step=True)
+
+        # 6. 记忆更新
+
+        # - 记忆生成: 最后一个上下文 → delta_memory (参与梯度，学习如何生成有用的记忆)
+        # - 记忆存储: delta_memory → 永久记忆 (不参与梯度，稳定的存储机制)
+        #   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+        #   │ context[0]  │ →  │ context[1]  │ →  │...context[N]│
+        #   │(injection)  │    │(injection)  │    │(injection)  │
+        #   └─────┬───────┘    └─────┬───────┘    └─────┬───────┘
+        #         │detach            │detach            │keep grad
+        #         ▼                  ▼                  ▼
+        #   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+        #   │  memory1    │    │  memory2    │    │  memoryN    │
+        #   └─────┬───────┘    └─────┬───────┘    └─────┬───────┘
+        #         │                  │                  │
+        #         └──────────────────┼──────────────────┘
+        #                            │
+        #                       ┌────▼────┐
+        #                       │target   │───→ loss
+        #                       │sentence │
+        #                       └─────────┘
 
         if not self.warmup_delta_memory or (self.warmup_delta_memory and self.trainer.global_step > 5000):
             if self.update_memory_during_training and delta_memory is not None:
